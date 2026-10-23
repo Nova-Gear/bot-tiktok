@@ -1,124 +1,238 @@
 import process from 'node:process';
+import * as readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 
-interface ExecutionParams {
+export type TargetType = 'account' | 'post';
+
+export interface ExecutionParams {
+    targetType: TargetType;
+    targetUrl: string;
     totalRuns: number;
     browserCount: number;
-    profileUrl: string;
+    reasons: string[];
 }
 
-interface TikTokReportConfig {
-    profileUrl: string;
-    reportReason: string;
-    reportReason2: string;
-    reportReason3: string;
-}
+const DEFAULT_ACCOUNT_URL = 'https://www.tiktok.com/@pojok.lamongan';
+const DEFAULT_POST_URL = 'https://www.tiktok.com/@pojok.lamongan/photo/7699855175837633793';
+
+const DEFAULT_ACCOUNT_REASONS = [
+    'Something else',
+    'Hate and harassment',
+    'Hate speech and hateful behaviors',
+];
+
+const DEFAULT_POST_REASONS = [
+    'Misinformation',
+    'Deepfakes, synthetic media, and manipulated media',
+];
 
 /**
  * Normalisasi URL TikTok agar fleksibel menerima URL lengkap maupun @username
  */
-function normalizeTikTokUrl(inputUrl?: string): string {
-    const defaultUrl = 'https://www.tiktok.com/@pojok.lamongan';
-    if (!inputUrl || !inputUrl.trim()) {
-        return defaultUrl;
+export function normalizeTikTokUrl(rawInput: string, targetType: TargetType): string {
+    const trimmed = (rawInput || '').trim();
+    if (!trimmed) {
+        return targetType === 'account' ? DEFAULT_ACCOUNT_URL : DEFAULT_POST_URL;
     }
 
-    const trimmed = inputUrl.trim();
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
         return trimmed;
     }
+
     if (trimmed.startsWith('@')) {
         return `https://www.tiktok.com/${trimmed}`;
     }
+
     if (trimmed.includes('tiktok.com/')) {
         return `https://${trimmed.replace(/^https?:\/\//, '')}`;
     }
-    return `https://www.tiktok.com/@${trimmed}`;
+
+    if (targetType === 'account') {
+        return `https://www.tiktok.com/@${trimmed}`;
+    }
+
+    return `https://${trimmed}`;
 }
 
 /**
- * Tampilkan panduan penggunaan parameter jika npm start dijalankan tanpa parameter
+ * Deteksi otomatis tipe target dari format URL jika tidak ditentukan eksplisit
  */
-function showTutorialAndExit(): never {
-    console.log(`
+export function detectTargetTypeFromUrl(url: string): TargetType {
+    if (url.includes('/video/') || url.includes('/photo/') || url.includes('vt.tiktok.com')) {
+        return 'post';
+    }
+    return 'account';
+}
+
+/**
+ * Helper prompter interaktif yang andal untuk TTY maupun automated stream
+ */
+function createInteractivePrompter() {
+    const rl = readline.createInterface({
+        input,
+        output,
+        terminal: Boolean(input.isTTY),
+        crlfDelay: Infinity,
+    });
+
+    const iterator = rl[Symbol.asyncIterator]();
+
+    return {
+        async ask(questionText: string): Promise<string> {
+            output.write(questionText);
+            const nextResult = await iterator.next();
+            if (nextResult.done) {
+                return '';
+            }
+            return String(nextResult.value).trim();
+        },
+        close(): void {
+            rl.close();
+        },
+    };
+}
+
+/**
+ * Tanya parameter secara interaktif di terminal jika tidak diberikan lewat CLI
+ */
+async function promptInteractiveParams(): Promise<ExecutionParams> {
+    const prompter = createInteractivePrompter();
+
+    console.log('\n======================================================');
+    console.log('🤖 TIKTOK REPORT AUTOMATION BOT');
+    console.log('======================================================');
+    console.log('Pilih target yang ingin di-takedown / di-report:');
+    console.log('  [1] Akun / Profil TikTok (Report Account)');
+    console.log('  [2] Postingan / Video / Foto TikTok (Report Post)');
+    console.log('------------------------------------------------------');
+
+    const typeChoice = await prompter.ask('Pilihan Anda (1 atau 2, default: 1): ');
+    const targetType: TargetType = typeChoice === '2' ? 'post' : 'account';
+
+    const defaultExample =
+        targetType === 'account'
+            ? `(default: ${DEFAULT_ACCOUNT_URL})`
+            : `(default: ${DEFAULT_POST_URL})`;
+
+    console.log(`\nMasukkan link target yang mau di-takedown ${defaultExample}:`);
+    const inputLink = await prompter.ask('Link target: ');
+
+    const targetUrl = normalizeTikTokUrl(inputLink, targetType);
+
+    const inputRuns = await prompter.ask('Masukkan jumlah putaran (default: 1): ');
+    const parsedRuns = Number.parseInt(inputRuns, 10);
+    const totalRuns = Number.isFinite(parsedRuns) && parsedRuns > 0 ? parsedRuns : 1;
+
+    const inputBrowsers = await prompter.ask('Masukkan jumlah browser paralel (default: 1): ');
+    const parsedBrowsers = Number.parseInt(inputBrowsers, 10);
+    const browserCount = Number.isFinite(parsedBrowsers) && parsedBrowsers > 0 ? parsedBrowsers : 1;
+
+    prompter.close();
+
+    const reasons = targetType === 'account' ? DEFAULT_ACCOUNT_REASONS : DEFAULT_POST_REASONS;
+
+    return {
+        targetType,
+        targetUrl,
+        totalRuns,
+        browserCount,
+        reasons,
+    };
+}
+
+/**
+ * Parsing argumen CLI jika dipanggil dengan parameter:
+ * Contoh:
+ *   npm start (akan masuk mode interaktif)
+ *   npm start account 1 5 https://tiktok.com/@user
+ *   npm start post 1 5 https://tiktok.com/@user/video/...
+ *   npm start 1 5 https://tiktok.com/@user
+ */
+export async function getExecutionParams(): Promise<ExecutionParams> {
+    const rawArgs = process.argv.slice(2).filter((arg) => arg !== '--');
+
+    // Jika tidak ada argumen sama sekali, masuk ke mode interaktif yang ramah pengguna
+    if (rawArgs.length === 0) {
+        return promptInteractiveParams();
+    }
+
+    // Jika meminta bantuan (-h / --help)
+    if (rawArgs.includes('--help') || rawArgs.includes('-h')) {
+        console.log(`
 ========================================================================
 📖 PANDUAN PENGGUNAAN TIKTOK AUTOMATION BOT
 ========================================================================
 
-Format perintah:
-  npm start <jumlah_putaran> <jumlah_browser> [link_atau_username]
+Mode Interaktif (Tanya Langsung):
+  npm start
 
-Parameter yang dibutuhkan:
-  1. jumlah_putaran     : Berapa kali siklus automasi dijalankan secara berulang.
-  2. jumlah_browser     : Berapa banyak jendela browser yang dibuka secara bersamaan (paralel).
-  3. link_atau_username : (Opsional) Link lengkap atau @username profil TikTok target.
-                          Default: https://www.tiktok.com/@pojok.lamongan
+Mode Baris Perintah (CLI Argument):
+  npm start [tipe] <jumlah_putaran> <jumlah_browser> [link_target]
 
-------------------------------------------------------------------------
-💡 CONTOH CARA MENJALANKAN:
-------------------------------------------------------------------------
-  • 1 putaran dengan 5 browser sekaligus:
-      npm start 1 5
+Keterangan Parameter:
+  • tipe             : "account" (akun) atau "post" (postingan).
+                       Otomatis terdeteksi jika memasukkan link postingan (/video/ atau /photo/).
+  • jumlah_putaran   : Berapa kali siklus automasi diulang.
+  • jumlah_browser   : Jumlah browser paralel yang dibuka sekaligus.
+  • link_target      : URL profil/postingan atau @username target.
 
-  • 1 putaran dengan 5 browser ke target tertentu:
-      npm start 1 5 @akun.target
-      atau
-      npm start 1 5 https://www.tiktok.com/@akun.target
+Contoh Penggunaan:
+  1. Takedown Akun:
+     npm start account 1 5 @target.user
+     npm start 1 5 https://www.tiktok.com/@target.user
 
-  • 3 putaran berulang, masing-masing 2 browser paralel:
-      npm start 3 2 @akun.target
-
-------------------------------------------------------------------------
-ℹ️  TIPS PENGGUNA WINDOWS:
-  Anda juga bisa langsung dobel klik file "run.bat" untuk mengisi
-  parameter secara interaktif tanpa mengetik di terminal.
+  2. Takedown Postingan / Video / Foto:
+     npm start post 1 5 https://www.tiktok.com/@target.user/video/123456789
+     npm start 1 3 https://www.tiktok.com/@target.user/photo/7699855175837633793
 ========================================================================
-`);
-    process.exit(0);
-}
-
-/**
- * Parsing argumen CLI:
- * - Positional: npm start 1 5 https://www.tiktok.com/@username
- * - Flagged: npm start -- --runs 1 --browsers 5 --url @username
- * - Default URL: https://www.tiktok.com/@pojok.lamongan
- */
-function parseExecutionParams(): ExecutionParams {
-    const args = process.argv.slice(2).filter((arg) => arg !== '--');
-
-    // Jika dijalankan tanpa parameter atau meminta bantuan (--help)
-    if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
-        showTutorialAndExit();
+        `);
+        process.exit(0);
     }
 
+    let explicitType: TargetType | undefined;
     let rawRuns: string | undefined;
     let rawBrowsers: string | undefined;
     let rawUrl: string | undefined;
 
     const positional: string[] = [];
 
-    for (let index = 0; index < args.length; index++) {
-        const argument = args[index];
-        if (argument.startsWith('--runs=')) {
+    for (let index = 0; index < rawArgs.length; index++) {
+        const argument = rawArgs[index];
+        if (argument.startsWith('--type=')) {
+            const val = argument.split('=')[1].toLowerCase();
+            explicitType = val === 'post' || val === '2' ? 'post' : 'account';
+        } else if (argument === '--type' || argument === '-t') {
+            const val = (rawArgs[++index] || '').toLowerCase();
+            explicitType = val === 'post' || val === '2' ? 'post' : 'account';
+        } else if (argument.startsWith('--runs=')) {
             rawRuns = argument.split('=')[1];
         } else if (argument === '--runs' || argument === '-r') {
-            rawRuns = args[++index];
+            rawRuns = rawArgs[++index];
         } else if (argument.startsWith('--browsers=')) {
             rawBrowsers = argument.split('=')[1];
         } else if (argument === '--browsers' || argument === '-b') {
-            rawBrowsers = args[++index];
+            rawBrowsers = rawArgs[++index];
         } else if (argument.startsWith('--url=')) {
             rawUrl = argument.split('=')[1];
         } else if (argument === '--url' || argument === '-u') {
-            rawUrl = args[++index];
+            rawUrl = rawArgs[++index];
         } else if (!argument.startsWith('-')) {
             positional.push(argument);
         }
     }
 
-    // Mendukung urutan fleksibel:
-    // e.g. "1 5 https://tiktok.com/@target" atau "https://tiktok.com/@target 1 5"
     for (const arg of positional) {
+        const lower = arg.toLowerCase();
+        if (lower === 'account' || lower === 'akun' || lower === 'profile' || lower === 'profil') {
+            explicitType = 'account';
+            continue;
+        }
+        if (lower === 'post' || lower === 'postingan' || lower === 'video' || lower === 'photo' || lower === 'foto') {
+            explicitType = 'post';
+            continue;
+        }
+
         const isUrlLike =
             arg.startsWith('http://') ||
             arg.startsWith('https://') ||
@@ -136,14 +250,24 @@ function parseExecutionParams(): ExecutionParams {
         }
     }
 
+    const detectedType = rawUrl ? detectTargetTypeFromUrl(rawUrl) : 'account';
+    const targetType = explicitType ?? detectedType;
+    const targetUrl = normalizeTikTokUrl(rawUrl ?? '', targetType);
+
     const parsedRuns = Number.parseInt(rawRuns ?? '1', 10);
     const parsedBrowsers = Number.parseInt(rawBrowsers ?? '1', 10);
 
     const totalRuns = Number.isFinite(parsedRuns) && parsedRuns > 0 ? parsedRuns : 1;
     const browserCount = Number.isFinite(parsedBrowsers) && parsedBrowsers > 0 ? parsedBrowsers : 1;
-    const profileUrl = normalizeTikTokUrl(rawUrl);
+    const reasons = targetType === 'account' ? DEFAULT_ACCOUNT_REASONS : DEFAULT_POST_REASONS;
 
-    return { totalRuns, browserCount, profileUrl };
+    return {
+        targetType,
+        targetUrl,
+        totalRuns,
+        browserCount,
+        reasons,
+    };
 }
 
 /**
@@ -168,22 +292,14 @@ async function handleConsentDialog(page: Page, prefix = '[Browser]'): Promise<vo
 }
 
 /**
- * Jalankan alur pelaporan akun TikTok secara terstruktur
+ * Alur eksekusi pelaporan akun TikTok
  */
-async function reportTikTokAccount(
-    page: Page,
-    config: TikTokReportConfig,
-    prefix = '[Browser]'
-): Promise<void> {
-    const { profileUrl, reportReason, reportReason2, reportReason3 } = config;
-
-    console.log(`${prefix} 1. Membuka profil ${profileUrl} ...`);
-    await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
-
-    // Tutup banner cookies jika ada
+async function reportAccountFlow(page: Page, params: ExecutionParams, prefix: string): Promise<void> {
+    console.log(`${prefix} 1. Membuka profil: ${params.targetUrl} ...`);
+    await page.goto(params.targetUrl, { waitUntil: 'domcontentloaded' });
     await handleConsentDialog(page, prefix);
 
-    console.log(`${prefix} 2. Mengklik tombol menu opsi (titik tiga / actions) ...`);
+    console.log(`${prefix} 2. Mengklik tombol menu opsi profil (titik tiga / actions) ...`);
     const moreActionsButton = page.locator(
         'button[data-e2e="user-more"], [data-e2e="user-more"]:visible, button[aria-label*="Action"]:visible'
     ).first();
@@ -196,42 +312,82 @@ async function reportTikTokAccount(
     await reportButton.click();
     await page.waitForTimeout(1000);
 
-    console.log(`${prefix} 4. Mengklik opsi "Report account" ...`);
+    // Pada beberapa tampilan TikTok, opsi "Report account" muncul sebelum daftar alasan
     const reportAccountButton = page.getByText('Report account').first();
-    await reportAccountButton.waitFor({ state: 'visible', timeout: 15000 });
-    await reportAccountButton.click();
-    await page.waitForTimeout(1000);
+    const hasReportAccount = await reportAccountButton.isVisible({ timeout: 3500 }).catch(() => false);
+    if (hasReportAccount) {
+        console.log(`${prefix} 4. Mengklik opsi "Report account" ...`);
+        await reportAccountButton.click();
+        await page.waitForTimeout(1000);
+    }
 
-    console.log(`${prefix} 5. Memilih alasan: "${reportReason}" ...`);
-    const reason1 = page.getByText(reportReason).first();
-    await reason1.waitFor({ state: 'visible', timeout: 15000 });
-    await reason1.click();
-    await page.waitForTimeout(1000);
+    // Pilih alasan pelaporan secara berurutan
+    for (let index = 0; index < params.reasons.length; index++) {
+        const reasonText = params.reasons[index];
+        console.log(`${prefix} ${5 + index}. Memilih alasan: "${reasonText}" ...`);
+        const reasonOption = page.getByText(reasonText).first();
+        await reasonOption.waitFor({ state: 'visible', timeout: 15000 });
+        await reasonOption.click();
+        await page.waitForTimeout(1000);
+    }
 
-    console.log(`${prefix} 6. Memilih sub-alasan: "${reportReason2}" ...`);
-    const reason2 = page.getByText(reportReason2).first();
-    await reason2.waitFor({ state: 'visible', timeout: 15000 });
-    await reason2.click();
-    await page.waitForTimeout(1000);
-
-    console.log(`${prefix} 7. Memilih sub-alasan: "${reportReason3}" ...`);
-    const reason3 = page.getByText(reportReason3).first();
-    await reason3.waitFor({ state: 'visible', timeout: 15000 });
-    await reason3.click();
-    await page.waitForTimeout(1000);
-
-    console.log(`${prefix} 8. Mengklik tombol "Submit" ...`);
+    console.log(`${prefix} Mengklik tombol "Submit" ...`);
     const submitButton = page.getByText('Submit').first();
     await submitButton.waitFor({ state: 'visible', timeout: 15000 });
     await submitButton.click();
     await page.waitForTimeout(1000);
 
-    console.log(`${prefix} 9. Mengklik tombol "Done" ...`);
+    console.log(`${prefix} Mengklik tombol "Done" ...`);
     const doneButton = page.getByText('Done').first();
     await doneButton.waitFor({ state: 'visible', timeout: 15000 });
     await doneButton.click();
 
-    console.log(`${prefix} ✓ Alur report berhasil dijalankan!`);
+    console.log(`${prefix} ✓ Berhasil melaporkan akun target!`);
+}
+
+/**
+ * Alur eksekusi pelaporan postingan TikTok (Video / Foto)
+ */
+async function reportPostFlow(page: Page, params: ExecutionParams, prefix: string): Promise<void> {
+    console.log(`${prefix} 1. Membuka postingan: ${params.targetUrl} ...`);
+    await page.goto(params.targetUrl, { waitUntil: 'domcontentloaded' });
+    await handleConsentDialog(page, prefix);
+
+    console.log(`${prefix} 2. Mengklik tombol menu opsi postingan (titik tiga) ...`);
+    const moreActionsButton = page.locator(
+        'div[data-e2e="browse-ellipsis"], [data-e2e="browse-ellipsis"], [data-e2e="more-menu-icon"], button[aria-label*="Action"]:visible, button[aria-label*="more"]:visible'
+    ).first();
+    await moreActionsButton.waitFor({ state: 'visible', timeout: 15000 });
+    await moreActionsButton.click();
+
+    console.log(`${prefix} 3. Mengklik opsi "Report" ...`);
+    const reportButton = page.getByText('Report').first();
+    await reportButton.waitFor({ state: 'visible', timeout: 15000 });
+    await reportButton.click();
+    await page.waitForTimeout(1000);
+
+    // Pilih alasan pelaporan postingan secara berurutan
+    for (let index = 0; index < params.reasons.length; index++) {
+        const reasonText = params.reasons[index];
+        console.log(`${prefix} ${4 + index}. Memilih alasan: "${reasonText}" ...`);
+        const reasonOption = page.getByText(reasonText).first();
+        await reasonOption.waitFor({ state: 'visible', timeout: 15000 });
+        await reasonOption.click();
+        await page.waitForTimeout(1000);
+    }
+
+    console.log(`${prefix} Mengklik tombol "Submit" ...`);
+    const submitButton = page.getByText('Submit').first();
+    await submitButton.waitFor({ state: 'visible', timeout: 15000 });
+    await submitButton.click();
+    await page.waitForTimeout(1000);
+
+    console.log(`${prefix} Mengklik tombol "Done" ...`);
+    const doneButton = page.getByText('Done').first();
+    await doneButton.waitFor({ state: 'visible', timeout: 15000 });
+    await doneButton.click();
+
+    console.log(`${prefix} ✓ Berhasil melaporkan postingan target!`);
 }
 
 /**
@@ -268,13 +424,17 @@ async function createBrowserInstance(workerId = 1): Promise<{ browser: Browser; 
  */
 async function runBrowserWorker(
     workerId: number,
-    config: TikTokReportConfig
+    params: ExecutionParams
 ): Promise<Browser | null> {
     const prefix = `[Browser #${workerId}]`;
 
     try {
         const { browser, page } = await createBrowserInstance(workerId);
-        await reportTikTokAccount(page, config, prefix);
+        if (params.targetType === 'account') {
+            await reportAccountFlow(page, params, prefix);
+        } else {
+            await reportPostFlow(page, params, prefix);
+        }
         return browser;
     } catch (error: unknown) {
         console.error(`${prefix} ⚠️ Terjadi kendala saat automasi:`, error);
@@ -286,55 +446,49 @@ async function runBrowserWorker(
  * Fungsi utama (Entry point)
  */
 async function main(): Promise<void> {
-    const { totalRuns, browserCount, profileUrl } = parseExecutionParams();
+    const params = await getExecutionParams();
 
-    console.log('======================================================');
+    console.log('\n======================================================');
     console.log('🚀 Memulai TikTok Report Automation');
-    console.log(`- Target Profil TikTok    : ${profileUrl}`);
-    console.log(`- Jumlah Putaran (Runs)   : ${totalRuns}`);
-    console.log(`- Browser Paralel         : ${browserCount}`);
-    console.log('------------------------------------------------------');
-    console.log('Tips: npm start <runs> <browsers> [profile_url]');
-    console.log('Contoh: npm start 1 5 https://www.tiktok.com/@pojok.lamongan');
-    console.log('Atau  : npm start 1 5 @pojok.lamongan');
+    console.log(`- Tipe Target             : ${params.targetType === 'account' ? 'Akun / Profil' : 'Postingan (Video/Foto)'}`);
+    console.log(`- Target URL              : ${params.targetUrl}`);
+    console.log(`- Alasan Pelaporan        : ${params.reasons.join(' -> ')}`);
+    console.log(`- Jumlah Putaran (Runs)   : ${params.totalRuns}`);
+    console.log(`- Browser Paralel         : ${params.browserCount}`);
     console.log('======================================================\n');
 
-    const config: TikTokReportConfig = {
-        profileUrl,
-        reportReason: 'Something else',
-        reportReason2: 'Hate and harassment',
-        reportReason3: 'Hate speech and hateful behaviors',
-    };
+    for (let currentRun = 1; currentRun <= params.totalRuns; currentRun++) {
+        console.log(`▶ [Putaran ${currentRun}/${params.totalRuns}] Membuka ${params.browserCount} browser secara paralel...`);
 
-    for (let currentRun = 1; currentRun <= totalRuns; currentRun++) {
-        console.log(`\n▶ [Putaran ${currentRun}/${totalRuns}] Membuka ${browserCount} browser secara paralel...`);
-
-        // Buat array worker berdasarkan jumlah browser yang diminta
-        const workerPromises = Array.from({ length: browserCount }, (_, index) =>
-            runBrowserWorker(index + 1, config)
+        const workerPromises = Array.from({ length: params.browserCount }, (_, index) =>
+            runBrowserWorker(index + 1, params)
         );
 
-        // Jalankan semua browser secara paralel
         const results = await Promise.all(workerPromises);
         const validBrowsers = results.filter((b): b is Browser => b !== null);
 
-        console.log(`[Putaran ${currentRun}/${totalRuns}] Selesai. Menutup ${validBrowsers.length} browser...`);
+        console.log(`[Putaran ${currentRun}/${params.totalRuns}] Selesai. Menutup ${validBrowsers.length} browser...`);
         await Promise.all(validBrowsers.map((browser) => browser.close()));
 
-        // Beri jeda antar putaran jika masih ada putaran berikutnya
-        if (currentRun < totalRuns) {
-            console.log('Menunggu 2 detik sebelum memulai putaran berikutnya...');
+        if (currentRun < params.totalRuns) {
+            console.log('Menunggu 2 detik sebelum memulai putaran berikutnya...\n');
             await new Promise((resolve) => setTimeout(resolve, 2000));
         }
     }
 
     console.log('\n======================================================');
-    console.log('🎉 Seluruh putaran automasi telah selesai dengan sukses!');
+    console.log('🎉 Seluruh putaran automasi telah selesai!');
     console.log('Semua browser telah ditutup secara otomatis.');
     console.log('======================================================\n');
 }
 
-main().catch((error: unknown) => {
-    console.error('Terjadi kesalahan:', error);
-    process.exit(1);
-});
+const isDirectExecution =
+    Boolean(process.argv[1]) &&
+    (process.argv[1].endsWith('index.ts') || process.argv[1].endsWith('index.js'));
+
+if (isDirectExecution) {
+    main().catch((error: unknown) => {
+        console.error('Terjadi kesalahan fatal:', error);
+        process.exit(1);
+    });
+}
