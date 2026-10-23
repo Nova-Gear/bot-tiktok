@@ -287,8 +287,138 @@ async function handleConsentDialog(page: Page, prefix = '[Browser]'): Promise<vo
         return;
     }
 
-    await consentButtons.first().click();
+    await consentButtons.first().click().catch(() => {});
     console.log(`${prefix} ✓ Dialog cookie disetujui.`);
+}
+
+/**
+ * Tutup modal/popup login TikTok jika muncul tiba-tiba dan menghalangi layar
+ */
+async function dismissLoginModalIfPresent(page: Page, prefix = '[Browser]'): Promise<void> {
+    const closeButtons = page.locator(
+        '[data-e2e="modal-close-icon"], button[aria-label="Close"], button[aria-label="close" i], div[class*="modal-close"]'
+    );
+
+    const isVisible = await closeButtons.first().isVisible({ timeout: 1500 }).catch(() => false);
+    if (isVisible) {
+        await closeButtons.first().click().catch(() => {});
+        console.log(`${prefix} ✓ Pop-up login/modal pengganggu ditutup.`);
+        await page.waitForTimeout(500);
+    }
+}
+
+/**
+ * Klik elemen secara aman dengan retry singkat jika elemen sempat detached dari DOM atau beranimasi
+ */
+async function safeClick(
+    locator: ReturnType<Page['locator']>,
+    actionName: string,
+    prefix: string,
+    timeoutMs = 15000
+): Promise<void> {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+        try {
+            await locator.waitFor({ state: 'visible', timeout: 3000 });
+            await locator.click({ timeout: 3000 });
+            return;
+        } catch {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+    }
+    // Percobaan terakhir jika timeout tercapai
+    await locator.click({ timeout: 4000 });
+}
+
+/**
+ * Buka menu aksi (titik tiga) dan klik opsi "Report" secara tangguh dengan retry otomatis
+ */
+async function openMenuAndClickReport(
+    page: Page,
+    moreActionsSelector: string,
+    prefix: string,
+    expectedReasonText?: string,
+    maxRetries = 3
+): Promise<void> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            await dismissLoginModalIfPresent(page, prefix);
+
+            const attemptPrefix = attempt > 1 ? `[Percobaan #${attempt}] ` : '';
+            console.log(`${prefix} ${attemptPrefix}Mengklik tombol menu opsi (titik tiga) ...`);
+
+            const moreActionsButton = page.locator(moreActionsSelector).first();
+            await moreActionsButton.waitFor({ state: 'visible', timeout: 10000 });
+            await moreActionsButton.click({ timeout: 4000 });
+            await page.waitForTimeout(800);
+
+            console.log(`${prefix} ${attemptPrefix}Mengklik opsi "Report" ...`);
+            const reportOption = page.locator(
+                '.TUXMenuItem:has-text("Report"), [role="menuitem"]:has-text("Report"), button:has-text("Report"), div:has-text("Report")'
+            ).filter({ hasText: /^Report$/i }).or(page.getByText('Report')).first();
+
+            await reportOption.waitFor({ state: 'visible', timeout: 4000 });
+            await reportOption.click({ timeout: 4000 });
+            await page.waitForTimeout(1200);
+
+            // Verifikasi bahwa dialog atau daftar alasan pelaporan sudah terbuka
+            const reportDialogOrReason = expectedReasonText
+                ? page.getByText(expectedReasonText).or(page.getByText('Report account')).or(page.locator('[role="dialog"]')).first()
+                : page.locator('[role="dialog"], [data-e2e*="report"], [data-e2e*="modal"], button:has-text("Submit")')
+                    .or(page.getByText('Report account'))
+                    .or(page.getByText('Misinformation'))
+                    .or(page.getByText('Something else'))
+                    .first();
+
+            const isModalOpen = await reportDialogOrReason.isVisible({ timeout: 4000 }).catch(() => false);
+            if (isModalOpen) {
+                console.log(`${prefix} ✓ Modal pelaporan berhasil dibuka.`);
+                return;
+            }
+
+            console.log(`${prefix} Menu opsi tertutup kembali sebelum report terbuka, mencoba klik ulang...`);
+        } catch {
+            console.log(`${prefix} Menu opsi sempat detached/tertutup (percobaan ${attempt}/${maxRetries}), mencoba ulang...`);
+            await page.waitForTimeout(1000);
+        }
+    }
+
+    // Fallback terakhir
+    const fallbackReport = page.getByText('Report').first();
+    await fallbackReport.waitFor({ state: 'visible', timeout: 6000 });
+    await fallbackReport.click({ timeout: 4000 });
+}
+
+/**
+ * Klik tombol Submit dan Done di dalam modal laporan TikTok secara aman
+ */
+async function submitAndDismissReportModal(page: Page, prefix: string): Promise<void> {
+    console.log(`${prefix} Mengklik tombol "Submit" ...`);
+    const modal = page.locator('[role="dialog"], [data-e2e*="report"], [data-e2e*="modal"], #tux-portal-container');
+    const submitButton = modal
+        .locator('button')
+        .filter({ hasText: /^Submit$/i })
+        .or(modal.locator('button:has-text("Submit")'))
+        .or(page.getByRole('button', { name: 'Submit', exact: true }))
+        .first();
+
+    await safeClick(submitButton, 'Submit', prefix);
+    await page.waitForTimeout(1000);
+
+    console.log(`${prefix} Mengklik tombol "Done" ...`);
+    const doneButton = modal
+        .locator('button')
+        .filter({ hasText: /^Done$/i })
+        .or(modal.locator('button:has-text("Done")'))
+        .or(page.getByRole('button', { name: 'Done', exact: true }))
+        .first();
+
+    const isDoneVisible = await doneButton.isVisible({ timeout: 4000 }).catch(() => false);
+    if (isDoneVisible) {
+        await doneButton.click({ force: true, timeout: 3000 }).catch(async () => {
+            await page.keyboard.press('Escape').catch(() => {});
+        });
+    }
 }
 
 /**
@@ -296,52 +426,37 @@ async function handleConsentDialog(page: Page, prefix = '[Browser]'): Promise<vo
  */
 async function reportAccountFlow(page: Page, params: ExecutionParams, prefix: string): Promise<void> {
     console.log(`${prefix} 1. Membuka profil: ${params.targetUrl} ...`);
-    await page.goto(params.targetUrl, { waitUntil: 'domcontentloaded' });
+    await page.goto(params.targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await handleConsentDialog(page, prefix);
+    await dismissLoginModalIfPresent(page, prefix);
 
-    console.log(`${prefix} 2. Mengklik tombol menu opsi profil (titik tiga / actions) ...`);
-    const moreActionsButton = page.locator(
-        'button[data-e2e="user-more"], [data-e2e="user-more"]:visible, button[aria-label*="Action"]:visible'
-    ).first();
-    await moreActionsButton.waitFor({ state: 'visible', timeout: 15000 });
-    await moreActionsButton.click();
-
-    console.log(`${prefix} 3. Mengklik opsi "Report" ...`);
-    const reportButton = page.getByText('Report').first();
-    await reportButton.waitFor({ state: 'visible', timeout: 15000 });
-    await reportButton.click();
-    await page.waitForTimeout(1000);
+    console.log(`${prefix} 2. Membuka menu opsi & memilih Report ...`);
+    await openMenuAndClickReport(
+        page,
+        'button[data-e2e="user-more"], [data-e2e="user-more"]:visible, button[aria-label*="Action"]:visible',
+        prefix,
+        params.reasons[0]
+    );
 
     // Pada beberapa tampilan TikTok, opsi "Report account" muncul sebelum daftar alasan
     const reportAccountButton = page.getByText('Report account').first();
     const hasReportAccount = await reportAccountButton.isVisible({ timeout: 3500 }).catch(() => false);
     if (hasReportAccount) {
-        console.log(`${prefix} 4. Mengklik opsi "Report account" ...`);
-        await reportAccountButton.click();
+        console.log(`${prefix} Mengklik opsi "Report account" ...`);
+        await safeClick(reportAccountButton, 'Report account', prefix);
         await page.waitForTimeout(1000);
     }
 
     // Pilih alasan pelaporan secara berurutan
     for (let index = 0; index < params.reasons.length; index++) {
         const reasonText = params.reasons[index];
-        console.log(`${prefix} ${5 + index}. Memilih alasan: "${reasonText}" ...`);
+        console.log(`${prefix} Memilih alasan (${index + 1}/${params.reasons.length}): "${reasonText}" ...`);
         const reasonOption = page.getByText(reasonText).first();
-        await reasonOption.waitFor({ state: 'visible', timeout: 15000 });
-        await reasonOption.click();
+        await safeClick(reasonOption, `Alasan "${reasonText}"`, prefix);
         await page.waitForTimeout(1000);
     }
 
-    console.log(`${prefix} Mengklik tombol "Submit" ...`);
-    const submitButton = page.getByText('Submit').first();
-    await submitButton.waitFor({ state: 'visible', timeout: 15000 });
-    await submitButton.click();
-    await page.waitForTimeout(1000);
-
-    console.log(`${prefix} Mengklik tombol "Done" ...`);
-    const doneButton = page.getByText('Done').first();
-    await doneButton.waitFor({ state: 'visible', timeout: 15000 });
-    await doneButton.click();
-
+    await submitAndDismissReportModal(page, prefix);
     console.log(`${prefix} ✓ Berhasil melaporkan akun target!`);
 }
 
@@ -350,43 +465,28 @@ async function reportAccountFlow(page: Page, params: ExecutionParams, prefix: st
  */
 async function reportPostFlow(page: Page, params: ExecutionParams, prefix: string): Promise<void> {
     console.log(`${prefix} 1. Membuka postingan: ${params.targetUrl} ...`);
-    await page.goto(params.targetUrl, { waitUntil: 'domcontentloaded' });
+    await page.goto(params.targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await handleConsentDialog(page, prefix);
+    await dismissLoginModalIfPresent(page, prefix);
 
-    console.log(`${prefix} 2. Mengklik tombol menu opsi postingan (titik tiga) ...`);
-    const moreActionsButton = page.locator(
-        'div[data-e2e="browse-ellipsis"], [data-e2e="browse-ellipsis"], [data-e2e="more-menu-icon"], button[aria-label*="Action"]:visible, button[aria-label*="more"]:visible'
-    ).first();
-    await moreActionsButton.waitFor({ state: 'visible', timeout: 15000 });
-    await moreActionsButton.click();
-
-    console.log(`${prefix} 3. Mengklik opsi "Report" ...`);
-    const reportButton = page.getByText('Report').first();
-    await reportButton.waitFor({ state: 'visible', timeout: 15000 });
-    await reportButton.click();
-    await page.waitForTimeout(1000);
+    console.log(`${prefix} 2. Membuka menu opsi & memilih Report ...`);
+    await openMenuAndClickReport(
+        page,
+        'div[data-e2e="browse-ellipsis"], [data-e2e="browse-ellipsis"], [data-e2e="more-menu-icon"], button[aria-label*="Action"]:visible, button[aria-label*="more"]:visible',
+        prefix,
+        params.reasons[0]
+    );
 
     // Pilih alasan pelaporan postingan secara berurutan
     for (let index = 0; index < params.reasons.length; index++) {
         const reasonText = params.reasons[index];
-        console.log(`${prefix} ${4 + index}. Memilih alasan: "${reasonText}" ...`);
+        console.log(`${prefix} Memilih alasan (${index + 1}/${params.reasons.length}): "${reasonText}" ...`);
         const reasonOption = page.getByText(reasonText).first();
-        await reasonOption.waitFor({ state: 'visible', timeout: 15000 });
-        await reasonOption.click();
+        await safeClick(reasonOption, `Alasan "${reasonText}"`, prefix);
         await page.waitForTimeout(1000);
     }
 
-    console.log(`${prefix} Mengklik tombol "Submit" ...`);
-    const submitButton = page.getByText('Submit').first();
-    await submitButton.waitFor({ state: 'visible', timeout: 15000 });
-    await submitButton.click();
-    await page.waitForTimeout(1000);
-
-    console.log(`${prefix} Mengklik tombol "Done" ...`);
-    const doneButton = page.getByText('Done').first();
-    await doneButton.waitFor({ state: 'visible', timeout: 15000 });
-    await doneButton.click();
-
+    await submitAndDismissReportModal(page, prefix);
     console.log(`${prefix} ✓ Berhasil melaporkan postingan target!`);
 }
 
