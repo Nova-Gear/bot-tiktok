@@ -505,6 +505,7 @@ async function createBrowserInstance(workerId = 1): Promise<{ browser: Browser; 
         slowMo: isHeadless ? 0 : 100,
         args: [
             '--disable-blink-features=AutomationControlled',
+            '--mute-audio',
             `--window-position=${positionX},${positionY}`,
         ],
     });
@@ -514,6 +515,18 @@ async function createBrowserInstance(workerId = 1): Promise<{ browser: Browser; 
         userAgent:
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
     });
+
+    // Blokir pemuatan gambar dan media (video/audio) untuk menghemat RAM dan CPU secara signifikan
+    const shouldBlockMedia = process.env.BLOCK_MEDIA !== 'false';
+    if (shouldBlockMedia) {
+        await context.route('**/*', (route) => {
+            const resourceType = route.request().resourceType();
+            if (resourceType === 'image' || resourceType === 'media') {
+                return route.abort();
+            }
+            return route.continue();
+        });
+    }
 
     const page: Page = await context.newPage();
     return { browser, page };
